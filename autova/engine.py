@@ -16,7 +16,15 @@ from autova.reporting import write_reports
 from autova.risk import make_finding, risk_summary
 from autova.scope import Scope, normalize_target
 from autova.terminal import TerminalReporter
-from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_observations, tool_plans
+from autova.tools import (
+    ToolResult,
+    ToolRunner,
+    findings_from_tool,
+    http_endpoint_fallback,
+    result_category,
+    tool_observations,
+    tool_plans,
+)
 
 
 SCHEMA = """
@@ -63,18 +71,45 @@ class AssessmentEngine:
         findings = list(reconnaissance["findings"])
         tool_results = []
         tool_result_rows: dict[str, list[dict[str, str]]] = {}
+        tool_display_status: dict[str, str] = {}
         for name, args in tool_plans(target, self.scope):
-            self.console.tool_warning(name, target)
+            category = result_category(name)
+            self.console.tool_warning(category, target)
             result = self.runner.execute(name, args)
             tool_results.append(result)
             observations = tool_observations(result, target)
+            display_status = "partial" if result.status == "timeout" and result.stdout.strip() else result.status
+            if name == "httpx" and result.status != "ok":
+                fallback = http_endpoint_fallback(target)
+                observations.append(fallback)
+                if fallback["result"].startswith("HTTPS "):
+                    display_status = "fallback"
             tool_result_rows[name] = observations
+            tool_display_status[name] = display_status
             tool_findings = findings_from_tool(result, target)
             findings.extend(tool_findings)
-            self.console.tool_result(name, result.status, observations)
+            self.console.tool_result(category, display_status, observations)
         summary = risk_summary(findings)
+        recon_checks = [reconnaissance["dns"], reconnaissance["tls"]]
+        successful_checks = (
+            sum(item.status == "ok" for item in tool_results)
+            + sum(item.get("status") == "ok" for item in recon_checks)
+        )
+        total_checks = len(tool_results) + len(recon_checks)
+        incomplete_checks = total_checks - successful_checks
+        summary["assessment_status"] = "complete" if incomplete_checks == 0 else "incomplete"
+        summary["checks_completed"] = successful_checks
+        summary["checks_total"] = total_checks
+        if incomplete_checks and summary["overall"] == "none":
+            summary["overall"] = "unknown"
         self.console.analysis(len(findings))
-        self.console.risk(summary["overall"], summary["score"], summary["finding_count"])
+        self.console.risk(
+            summary["overall"],
+            summary["score"],
+            summary["finding_count"],
+            successful_checks=successful_checks,
+            total_checks=total_checks,
+        )
         completed_at = datetime.now(timezone.utc).isoformat()
         report: dict[str, Any] = {
             "tool_name": "AutoVA",
@@ -98,6 +133,7 @@ class AssessmentEngine:
                     "name": item.name, "status": item.status, "command": item.command,
                     "returncode": item.returncode, "error": item.error,
                     "results": tool_result_rows[item.name],
+                    "display_status": tool_display_status[item.name],
                 }
                 for item in tool_results
             ],

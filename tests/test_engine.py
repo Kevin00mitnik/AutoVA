@@ -47,7 +47,12 @@ class EngineTests(unittest.TestCase):
                 "tls": {"status": "error", "error": "not tested"},
                 "findings": [],
             }
-            report = engine.scan("EXAMPLE.COM")
+            with patch("autova.engine.http_endpoint_fallback") as fallback:
+                fallback.return_value = {
+                    "result": "HTTP endpoint unavailable",
+                    "details": "Test fallback; no network request was made.",
+                }
+                report = engine.scan("EXAMPLE.COM")
             target_dir = Path(directory) / "example.com"
             self.assertTrue((target_dir / "scan.json").is_file())
             self.assertTrue((target_dir / "vulnerabilities.json").is_file())
@@ -60,18 +65,60 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(report["tool_name"], "AutoVA")
             self.assertEqual(report["author"], "Mohammed Arif Pallath")
             self.assertTrue(all(tool["status"] == "missing" for tool in report["tools"]))
+            self.assertEqual(report["risk"]["overall"], "unknown")
+            self.assertEqual(report["risk"]["assessment_status"], "incomplete")
+            self.assertEqual(report["risk"]["checks_total"], 8)
             output = stream.getvalue()
-            self.assertIn("WARNING: nmap", output)
-            self.assertIn("NMAP RESULTS", output)
+            self.assertIn("NOTICE: Checking open ports", output)
+            self.assertIn("OPEN PORTS", output)
             self.assertIn("ANALYSIS", output)
-            self.assertIn("RISK", output)
+            self.assertIn("RISK    INCOMPLETE", output)
             self.assertIn("report.html", output)
+            self.assertNotIn("nmap", output.lower())
+            self.assertNotIn("subfinder", output.lower())
+            self.assertNotIn("httpx", output.lower())
+            self.assertNotIn("whatweb", output.lower())
+            self.assertNotIn("nikto", output.lower())
+            self.assertNotIn("nuclei", output.lower())
             db = sqlite3.connect(Path(directory) / "assessments.sqlite3")
             try:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scans").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM tool_runs").fetchone()[0], 6)
             finally:
                 db.close()
+
+    def test_http_probe_failure_uses_exact_host_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FakeRunner()
+            runner.execute = lambda name, args: ToolResult(
+                name, "error" if name == "httpx" else "missing",
+                [name, *args], returncode=2, stderr="incompatible CLI",
+                error="Exited with status 2.",
+            )
+            stream = io.StringIO()
+            with patch("autova.engine.http_endpoint_fallback") as fallback:
+                fallback.return_value = {
+                    "result": "HTTPS 200",
+                    "details": "built-in exact-host fallback",
+                }
+                engine = AssessmentEngine(
+                    Scope(frozenset({"example.com"})),
+                    directory,
+                    runner,
+                    TerminalReporter(stream),
+                )
+                engine._reconnaissance = lambda target: {
+                    "dns": {"status": "ok", "addresses": ["192.0.2.10"]},
+                    "tls": {"status": "ok", "version": "TLSv1.3"},
+                    "findings": [],
+                }
+                report = engine.scan("example.com")
+            fallback.assert_called_once_with("example.com")
+            http_result = next(tool for tool in report["tools"] if tool["name"] == "httpx")
+            self.assertEqual(http_result["status"], "error")
+            self.assertEqual(http_result["display_status"], "fallback")
+            self.assertIn("HTTPS 200", stream.getvalue())
+            self.assertNotIn("httpx", stream.getvalue().lower())
 
 
 if __name__ == "__main__":

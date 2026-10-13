@@ -14,6 +14,14 @@ class FakeEngine:
         return {"target": target, "risk": {"overall": "none", "finding_count": 0}}
 
 
+class IncompleteEngine(FakeEngine):
+    def scan(self, target):
+        return {
+            "target": target,
+            "risk": {"overall": "unknown", "finding_count": 0, "assessment_status": "incomplete"},
+        }
+
+
 class CliTests(unittest.TestCase):
     def test_target_only_requires_interactive_confirmation_when_noninteractive(self):
         stderr = io.StringIO()
@@ -28,6 +36,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("Assessment complete for example.com", stdout.getvalue())
         self.assertIn("reports\\example.com\\scan.json", stdout.getvalue())
+
+    def test_incomplete_scan_is_not_reported_as_success(self):
+        stdout = io.StringIO()
+        with patch("autova.cli.AssessmentEngine", IncompleteEngine), patch("autova.cli.sys.stdout", stdout):
+            result = main(["--target", "example.com", "--yes"])
+        self.assertEqual(result, 0)
+        self.assertIn("Assessment incomplete; available results saved", stdout.getvalue())
+        self.assertIn("risk=UNKNOWN", stdout.getvalue())
 
     def test_interactive_confirmation_declines_by_default(self):
         stdout = io.StringIO()

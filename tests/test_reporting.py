@@ -11,7 +11,7 @@ class ReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             finding = {
                 "id": "x", "title": "<script>alert(1)</script>", "severity": "high",
-                "score": 8, "source": "test", "asset": "example.com", "detail": "", "evidence": "",
+                "score": 8, "source": "nmap", "asset": "example.com", "detail": "", "evidence": "",
             }
             report = {
                 "target": "example.com", "completed_at": "now",
@@ -23,6 +23,9 @@ class ReportingTests(unittest.TestCase):
             html = (output / "report.html").read_text(encoding="utf-8")
             self.assertNotIn("<script>alert(1)</script>", html)
             self.assertIn("&lt;script&gt;", html)
+            self.assertIn("Assessment categories", html)
+            self.assertIn("OPEN PORTS", html)
+            self.assertNotIn("nmap", html.lower())
 
 
 if __name__ == "__main__":

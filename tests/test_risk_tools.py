@@ -1,10 +1,20 @@
 import json
 import subprocess
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 from autova.risk import make_finding, risk_summary
 from autova.scope import Scope
-from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_observations, tool_plans
+from autova.tools import (
+    HTTPRedirectHandlerNoRedirect,
+    ToolResult,
+    ToolRunner,
+    findings_from_tool,
+    http_endpoint_fallback,
+    tool_observations,
+    tool_plans,
+)
 
 
 class RiskToolsTests(unittest.TestCase):
@@ -48,11 +58,72 @@ class RiskToolsTests(unittest.TestCase):
         runner.execute("httpx", [])
         self.assertEqual(delays, [2.0])
 
+    def test_tool_specific_timeouts_are_shorter_than_legacy_global_timeout(self):
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        runner = ToolRunner(
+            Scope(frozenset({"example.com"})),
+            which=lambda name: name,
+            run=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+        seen = []
+
+        def capture(command, **kwargs):
+            seen.append((command[0], kwargs["timeout"]))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner.run = capture
+        for name in ("nmap", "whatweb", "nikto", "nuclei"):
+            runner.execute(name, [])
+        self.assertEqual(seen, [("nmap", 60), ("whatweb", 30), ("nikto", 45), ("nuclei", 60)])
+
+    def test_nmap_xml_timeout_is_not_marked_successful_exit(self):
+        incomplete_xml = (
+            '<nmaprun><host><ports><extraports state="filtered" count="3"/></ports></host>'
+            '<runstats><finished exit="error" errormsg="Host timeout"/></runstats></nmaprun>'
+        )
+        runner = ToolRunner(
+            Scope(frozenset({"example.com"})),
+            which=lambda name: name,
+            run=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, incomplete_xml, ""),
+        )
+        result = runner.execute("nmap", ["example.com"])
+        self.assertEqual(result.status, "partial")
+        self.assertIn("Host timeout", result.error)
+
+    def test_http_fallback_does_not_follow_redirects(self):
+        class RedirectResponse:
+            def open(self, request, timeout):
+                raise HTTPError(
+                    request.full_url,
+                    302,
+                    "Redirect",
+                    {"Location": "https://outside.example/"},
+                    None,
+                )
+
+        with patch("autova.tools.build_opener", return_value=RedirectResponse()):
+            result = http_endpoint_fallback("example.com")
+        self.assertEqual(result["result"], "HTTPS 302")
+        self.assertIn("exact-host fallback", result["details"])
+        self.assertIsNone(HTTPRedirectHandlerNoRedirect().redirect_request(
+            None, None, 302, "Redirect", {"Location": "https://outside.example/"}, "https://outside.example/"
+        ))
+
     def test_plans_are_capped_and_discoveries_are_not_scanned(self):
         scope = Scope(frozenset({"example.com"}), 0.5, 100)
         args = dict(tool_plans("example.com", scope))["nmap"]
         self.assertIn("100", args)
         self.assertEqual(args[args.index("--max-rate") + 1], "1")
+        self.assertIn("--host-timeout", args)
+        self.assertNotIn("-sV", args)
+        http_args = dict(tool_plans("example.com", scope))["httpx"]
+        self.assertIn("https://example.com", http_args)
         findings = findings_from_tool(
             ToolResult("subfinder", "ok", [], stdout="example.com\nother.example.com\n"),
             "example.com",
@@ -92,7 +163,7 @@ class RiskToolsTests(unittest.TestCase):
                 "nginx 1.2",
             ),
             ("subfinder", "example.com\napi.example.com\n", "api.example.com"),
-            ("nikto", "+ Server: nginx/1.2\n", "nginx/1.2"),
+            ("nikto", "+ /admin/: directory listing\n+ Server: nginx/1.2\n", "Directory or file path"),
             (
                 "nuclei",
                 json.dumps({"template-id": "exposure", "matched-at": "https://example.com/x", "info": {"name": "Exposure", "severity": "medium"}}),
@@ -111,6 +182,19 @@ class RiskToolsTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["result"], "ERROR")
         self.assertIn("unknown flag: -json", rows[0]["details"])
+        self.assertNotIn("httpx", rows[0]["details"].lower())
+
+    def test_timeout_keeps_partial_open_port_results(self):
+        output = (
+            '<nmaprun><host><ports><port protocol="tcp" portid="443">'
+            '<state state="open"/><service name="https"/></port></ports></host></nmaprun>'
+        )
+        rows = tool_observations(
+            ToolResult("nmap", "timeout", [], stdout=output, error="Timed out after 60 seconds."),
+            "example.com",
+        )
+        self.assertTrue(any(row["result"] == "tcp/443 open" for row in rows))
+        self.assertTrue(any(row["result"] == "Partial results" for row in rows))
 
 
 if __name__ == "__main__":

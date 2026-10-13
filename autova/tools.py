@@ -9,6 +9,8 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 from autova.risk import make_finding
@@ -36,9 +38,18 @@ class ToolRunner:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         timeout: int = 120,
+        tool_timeouts: dict[str, int] | None = None,
     ) -> None:
         self.scope, self.which, self.run = scope, which, run
         self.clock, self.sleep, self.timeout = clock, sleep, timeout
+        self.tool_timeouts = tool_timeouts or {
+            "nmap": 60,
+            "subfinder": 30,
+            "httpx": 20,
+            "whatweb": 30,
+            "nikto": 45,
+            "nuclei": 60,
+        }
         self._last_run: float | None = None
 
     def execute(self, name: str, args: list[str]) -> ToolResult:
@@ -54,19 +65,30 @@ class ToolRunner:
         self._last_run = self.clock()
         try:
             completed = self.run(
-                command, capture_output=True, text=True, check=False, timeout=self.timeout
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.tool_timeouts.get(name, self.timeout),
             )
         except subprocess.TimeoutExpired as exc:
+            timeout = self.tool_timeouts.get(name, self.timeout)
             return ToolResult(
                 name, "timeout", command, stdout=_as_text(exc.stdout), stderr=_as_text(exc.stderr),
-                error=f"Timed out after {self.timeout} seconds.",
+                error=f"Timed out after {timeout} seconds.",
             )
         except OSError as exc:
             return ToolResult(name, "error", command, error=f"Could not start {name}: {exc}")
         ok = completed.returncode == 0
+        partial_error = _nmap_incomplete_reason(completed.stdout) if ok and name == "nmap" else None
         return ToolResult(
-            name, "ok" if ok else "error", command, completed.returncode,
-            completed.stdout, completed.stderr, "" if ok else f"Exited with status {completed.returncode}.",
+            name,
+            "partial" if partial_error else "ok" if ok else "error",
+            command,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            partial_error or ("" if ok else f"Exited with status {completed.returncode}."),
         )
 
 
@@ -78,20 +100,42 @@ def _as_text(value: str | bytes | None) -> str:
 
 def tool_plans(target: str, scope: Scope) -> list[tuple[str, list[str]]]:
     rate = max(1, int(scope.rate_limit_rps))
+    https_target = f"https://{target}"
     return [
-        ("nmap", ["-Pn", "-sT", "-sV", "--top-ports", str(scope.max_ports), "--max-rate", str(rate), "-oX", "-", target]),
+        (
+            "nmap",
+            [
+                "-n", "-Pn", "-sT", "-T4", "--top-ports", str(scope.max_ports),
+                "--max-retries", "1", "--initial-rtt-timeout", "1s",
+                "--max-rtt-timeout", "5s", "--host-timeout", "45s",
+                "--max-rate", str(rate), "-oX", "-", target,
+            ],
+        ),
         ("subfinder", ["-d", target, "-silent"]),
-        ("httpx", ["-u", f"http://{target}", "-silent", "-json", "-rate", str(rate), "-timeout", "5", "-retries", "0"]),
+        (
+            "httpx",
+            [
+                "-u", https_target, "-silent", "-json", "-status-code", "-title",
+                "-tech-detect", "-web-server", "-rate", str(rate), "-timeout", "5", "-retries", "0",
+            ],
+        ),
         (
             "whatweb",
-            ["--aggression=1", "--no-errors", "--log-json=-", "--wait=1", "--max-redirects=0", f"http://{target}"],
+            [
+                "--aggression=1", "--no-errors", "--log-json=-", "--wait=1",
+                "--max-redirects=0", "--max-threads=5", https_target,
+            ],
         ),
-        ("nikto", ["-host", f"http://{target}", "-Pause", "1", "-maxtime", "120s"]),
+        (
+            "nikto",
+            ["-host", https_target, "-Pause", "1", "-timeout", "5", "-maxtime", "30s", "-nointeractive"],
+        ),
         (
             "nuclei",
             [
-                "-u", f"http://{target}", "-silent", "-jsonl", "-rl", str(rate),
-                "-timeout", "5", "-retries", "0", "-disable-redirects", "-no-interactsh",
+                "-u", https_target, "-silent", "-jsonl", "-rl", str(rate),
+                "-timeout", "5", "-retries", "0", "-disable-redirects",
+                "-no-interactsh", "-duc", "-tags", "misconfig,exposure,cve",
             ],
         ),
     ]
@@ -118,39 +162,148 @@ def findings_from_tool(result: ToolResult, target: str) -> list[dict[str, Any]]:
 
 def tool_observations(result: ToolResult, target: str) -> list[dict[str, str]]:
     """Extract readable, target-only observations for live output and JSON reports."""
-    if result.status != "ok":
-        detail = result.error or "Tool did not complete successfully."
+    partial = result.status in {"partial", "timeout"} and bool(result.stdout.strip())
+    if result.status != "ok" and not partial:
+        if result.status == "missing":
+            return [{
+                "result": "Scanner unavailable",
+                "details": "The optional scanner program for this result category is not installed.",
+            }]
+        detail = _hide_scanner_names(result.error or "The check did not complete successfully.")
         diagnostic = result.stderr.strip() or result.stdout.strip()
         if diagnostic:
-            detail += f" | {diagnostic.splitlines()[0]}"
+            detail += f" | {_hide_scanner_names(diagnostic.splitlines()[0])}"
         return [{"result": result.status.upper(), "details": detail}]
+    if partial:
+        result = ToolResult(
+            result.name,
+            "ok",
+            result.command,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            result.error,
+        )
     if result.name == "nmap":
-        return _nmap_observations(result.stdout)
+        rows = _nmap_observations(result.stdout)
+        return _with_partial_note(rows, result) if partial else rows
     if result.name == "subfinder":
         hosts = sorted(set(line.strip() for line in result.stdout.splitlines() if line.strip()))
         hosts = [host for host in hosts if host.lower().rstrip(".") != target.lower().rstrip(".")]
-        return [
+        rows = [
             {"result": "Discovered host (not scanned)", "details": host}
             for host in hosts
         ] or [{"result": "No additional hostnames", "details": "No subdomains were reported."}]
+        return _with_partial_note(rows, result) if partial else rows
     if result.name == "httpx":
-        return _httpx_observations(result.stdout, target)
+        rows = _httpx_observations(result.stdout, target)
+        return _with_partial_note(rows, result) if partial else rows
     if result.name == "whatweb":
-        return _whatweb_observations(result.stdout, target)
+        rows = _whatweb_observations(result.stdout, target)
+        return _with_partial_note(rows, result) if partial else rows
     if result.name == "nikto":
-        observations = [
-            {"result": "Web server observation", "details": line.strip().lstrip("+").strip()}
-            for line in result.stdout.splitlines()
-            if line.strip().startswith("+") and line.strip().lstrip("+").strip()
-        ]
-        return observations or [{"result": "No web issues reported", "details": "Nikto reported no observations."}]
+        observations = []
+        for line in result.stdout.splitlines():
+            detail = line.strip().lstrip("+").strip()
+            if not detail:
+                continue
+            label = "Directory or file path" if detail.startswith("/") else "Web server finding"
+            observations.append({"result": label, "details": detail})
+        rows = observations or [{"result": "No web issues reported", "details": "No web issues were reported."}]
+        return _with_partial_note(rows, result) if partial else rows
     if result.name == "nuclei":
         observations = [
             {"result": f"{item['severity'].upper()} finding", "details": item["title"]}
             for item in findings_from_tool(result, target)
         ]
-        return observations or [{"result": "No template matches", "details": "Nuclei reported no findings."}]
+        rows = observations or [{"result": "No template matches", "details": "No vulnerability templates matched."}]
+        return _with_partial_note(rows, result) if partial else rows
     return [{"result": "Tool output", "details": "No structured observations are available."}]
+
+
+def result_category(name: str) -> str:
+    return {
+        "nmap": "OPEN PORTS",
+        "subfinder": "SUBDOMAINS",
+        "httpx": "WEB RESPONSE",
+        "whatweb": "TECHNOLOGIES",
+        "nikto": "WEB PATHS & FINDINGS",
+        "nuclei": "VULNERABILITY FINDINGS",
+    }.get(name, "ASSESSMENT RESULTS")
+
+
+def _with_partial_note(rows: list[dict[str, str]], result: ToolResult) -> list[dict[str, str]]:
+    rows = [row for row in rows if not row["result"].startswith("No ")]
+    rows.append({
+        "result": "Partial results",
+        "details": _hide_scanner_names(
+            result.error or "The time limit was reached; results may be incomplete."
+        ),
+    })
+    return rows
+
+
+def _nmap_incomplete_reason(output: str) -> str | None:
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return None
+    finished = root.find(".//runstats/finished")
+    if finished is not None and finished.get("exit") not in (None, "success"):
+        return finished.get("errormsg") or "Port scan did not finish."
+    return None
+
+
+def _hide_scanner_names(text: str) -> str:
+    import re
+
+    replacements = {
+        "nmap": "port scanner",
+        "subfinder": "subdomain scanner",
+        "httpx": "HTTP probe",
+        "whatweb": "technology checker",
+        "nikto": "web checker",
+        "nuclei": "vulnerability checker",
+    }
+    for name, category in replacements.items():
+        text = re.sub(rf"\b{re.escape(name)}\b", category, text, flags=re.IGNORECASE)
+    return text
+
+
+def http_endpoint_fallback(target: str, timeout: float = 8.0) -> dict[str, str]:
+    """Make one exact-host HTTPS request when the optional HTTP probe CLI is incompatible."""
+    opener = build_opener(HTTPRedirectHandlerNoRedirect)
+    host = f"[{target}]" if ":" in target else target
+    request = Request(
+        f"https://{host}/",
+        headers={"User-Agent": "AutoVA/0.1 (authorized assessment)"},
+        method="GET",
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return {
+                "result": f"HTTPS {response.status}",
+                "details": (
+                    f"HTTP endpoint responded; server: {response.headers.get('Server', 'not disclosed')} "
+                    "(built-in exact-host fallback)"
+                ),
+            }
+    except HTTPError as exc:
+        exc.close()
+        return {
+            "result": f"HTTPS {exc.code}",
+            "details": "The host responded with an HTTP status (built-in exact-host fallback).",
+        }
+    except (OSError, URLError, TimeoutError) as exc:
+        return {
+            "result": "HTTP endpoint unavailable",
+            "details": f"Built-in exact-host request could not complete: {exc}",
+        }
+
+
+class HTTPRedirectHandlerNoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _nmap_observations(output: str) -> list[dict[str, str]]:
@@ -177,7 +330,22 @@ def _nmap_observations(output: str) -> list[dict[str, str]]:
             "result": f"{port.get('protocol', 'tcp')}/{port.get('portid', '?')} open",
             "details": " · ".join(service_details) or "Service not identified",
         })
-    return rows or [{"result": "No open ports found", "details": "No open ports in the configured port range."}]
+    if rows:
+        return rows
+    host_status = root.find(".//host/status")
+    if host_status is not None and host_status.get("state") == "down":
+        return [{"result": "Host unreachable", "details": "The target did not respond to the port check."}]
+    counts = [
+        f"{extra.get('count', '?')} {extra.get('state', 'unknown')}"
+        for extra in root.findall(".//extraports")
+    ]
+    if counts:
+        return [{"result": "No open ports identified", "details": f"Port responses: {', '.join(counts)}."}]
+    finished = root.find(".//runstats/finished")
+    if finished is not None and finished.get("exit") != "success":
+        reason = finished.get("errormsg") or finished.get("exit") or "scan did not finish"
+        return [{"result": "Port check incomplete", "details": reason}]
+    return [{"result": "No port results", "details": "No open ports were reported in the available scan output."}]
 
 
 def _httpx_observations(output: str, target: str) -> list[dict[str, str]]:

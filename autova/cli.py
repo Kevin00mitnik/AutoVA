@@ -66,8 +66,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Assessment failed: {exc}", file=sys.stderr)
         return 1
     target_dir = Path(args.output) / target_directory_name(target)
+    complete = report["risk"].get("assessment_status", "complete") == "complete"
+    label = "Assessment complete" if complete else "Assessment incomplete; available results saved"
+    risk = report["risk"]["overall"].upper()
     print(
-        f"Assessment complete for {target}: risk={report['risk']['overall']} "
+        f"{label} for {target}: risk={risk} "
         f"findings={report['risk']['finding_count']}"
     )
     print(f"Reports: {target_dir / 'scan.json'}, {target_dir / 'vulnerabilities.json'}, {target_dir / 'report.html'}")

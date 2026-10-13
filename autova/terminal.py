@@ -19,9 +19,12 @@ class TerminalReporter:
         return f"\033[{code}m{text}\033[0m" if self.color else text
 
     def start(self, target: str) -> None:
-        print(self._paint("AUTOVA  |  AUTHORIZED SECURITY ASSESSMENT", "1;36"), file=self.stream)
-        print(f"Tool: AutoVA  |  Author: Mohammed Arif Pallath  |  Target: {target}", file=self.stream)
-        print(self._paint("SCOPE   Exact target only | scanner tools can send network traffic", "1;33"), file=self.stream)
+        print(self._paint("+--------------------------------------------------------------+", "36"), file=self.stream)
+        print(self._paint("|  AutoVA  |  AUTHORIZED SECURITY ASSESSMENT                   |", "1;36"), file=self.stream)
+        print(self._paint("|  Created by Mohammed Arif Pallath                            |", "36"), file=self.stream)
+        print(self._paint("+--------------------------------------------------------------+", "36"), file=self.stream)
+        print(f"TARGET  {target}", file=self.stream)
+        print(self._paint("NOTICE  Active network checks run only for this authorized target.", "1;33"), file=self.stream)
         print(self._paint("RECON   DNS and TLS checks", "36"), file=self.stream)
 
     def reconnaissance(self, dns: dict, tls: dict) -> None:
@@ -29,21 +32,25 @@ class TerminalReporter:
         self._status_line("RECON", "DNS", dns.get("status", "unknown"), addresses)
         tls_detail = tls.get("version") or tls.get("error", "no TLS details")
         self._status_line("RECON", "TLS", tls.get("status", "unknown"), tls_detail)
-        print(self._paint("ENUM    External scanner tools", "36"), file=self.stream)
+        print(self._paint("ENUM    Results grouped by finding type", "36"), file=self.stream)
 
-    def tool_warning(self, name: str, target: str) -> None:
+    def tool_warning(self, category: str, target: str) -> None:
         print(
             self._paint(
-                f"WARNING: {name} may send traffic to {target}; confirm authorization and scope.",
+                f"NOTICE: Checking {category.lower()} on {target} may send network traffic.",
                 "33",
             ),
             file=self.stream,
         )
-        print(self._paint(f"RUNNING {name.upper()}...", "1;36"), file=self.stream)
+        print(self._paint(f"CHECKING {category}...", "1;36"), file=self.stream)
 
-    def tool_result(self, name: str, status: str, rows: list[dict[str, str]]) -> None:
-        color = {"ok": "32", "missing": "33", "timeout": "33", "error": "31"}.get(status, "36")
-        print(self._paint(f"\n{name.upper()} RESULTS  [{status.upper()}]", f"1;{color}"), file=self.stream)
+    def tool_result(self, category: str, status: str, rows: list[dict[str, str]]) -> None:
+        color = {"ok": "32", "fallback": "32", "partial": "33", "missing": "33", "timeout": "33", "error": "31"}.get(status, "36")
+        status_text = {"fallback": "BACKUP CHECK", "partial": "PARTIAL"}.get(status, status.upper())
+        print(
+            self._paint(f"\n{category}  ·  {status_text}", f"1;{color}"),
+            file=self.stream,
+        )
         first_width, second_width = 29, 76
         border = f"+{'-' * (first_width + 2)}+{'-' * (second_width + 2)}+"
         print(border, file=self.stream)
@@ -66,11 +73,23 @@ class TerminalReporter:
     def analysis(self, finding_count: int) -> None:
         self._status_line("ANALYSIS", "Vulnerability review", "done", f"{finding_count} finding(s) normalized")
 
-    def risk(self, level: str, score: int, finding_count: int) -> None:
-        color = "31" if level in ("critical", "high") else "33" if level == "medium" else "32"
+    def risk(
+        self,
+        level: str,
+        score: int,
+        finding_count: int,
+        *,
+        successful_checks: int | None = None,
+        total_checks: int | None = None,
+    ) -> None:
+        color = "31" if level in ("critical", "high") else "33" if level in ("medium", "unknown") else "32"
+        risk_label = "INCOMPLETE" if level == "unknown" else level.upper()
+        coverage = ""
+        if successful_checks is not None and total_checks is not None:
+            coverage = f" | checks completed {successful_checks}/{total_checks}"
         print(
             self._paint(
-                f"RISK    {level.upper()} | score {score}/10 | {finding_count} finding(s)",
+                f"RISK    {risk_label} | score {score}/10 | {finding_count} finding(s){coverage}",
                 f"1;{color}",
             ),
             file=self.stream,
