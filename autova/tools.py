@@ -116,6 +116,136 @@ def findings_from_tool(result: ToolResult, target: str) -> list[dict[str, Any]]:
     return []
 
 
+def tool_observations(result: ToolResult, target: str) -> list[dict[str, str]]:
+    """Extract readable, target-only observations for live output and JSON reports."""
+    if result.status != "ok":
+        detail = result.error or "Tool did not complete successfully."
+        diagnostic = result.stderr.strip() or result.stdout.strip()
+        if diagnostic:
+            detail += f" | {diagnostic.splitlines()[0]}"
+        return [{"result": result.status.upper(), "details": detail}]
+    if result.name == "nmap":
+        return _nmap_observations(result.stdout)
+    if result.name == "subfinder":
+        hosts = sorted(set(line.strip() for line in result.stdout.splitlines() if line.strip()))
+        hosts = [host for host in hosts if host.lower().rstrip(".") != target.lower().rstrip(".")]
+        return [
+            {"result": "Discovered host (not scanned)", "details": host}
+            for host in hosts
+        ] or [{"result": "No additional hostnames", "details": "No subdomains were reported."}]
+    if result.name == "httpx":
+        return _httpx_observations(result.stdout, target)
+    if result.name == "whatweb":
+        return _whatweb_observations(result.stdout, target)
+    if result.name == "nikto":
+        observations = [
+            {"result": "Web server observation", "details": line.strip().lstrip("+").strip()}
+            for line in result.stdout.splitlines()
+            if line.strip().startswith("+") and line.strip().lstrip("+").strip()
+        ]
+        return observations or [{"result": "No web issues reported", "details": "Nikto reported no observations."}]
+    if result.name == "nuclei":
+        observations = [
+            {"result": f"{item['severity'].upper()} finding", "details": item["title"]}
+            for item in findings_from_tool(result, target)
+        ]
+        return observations or [{"result": "No template matches", "details": "Nuclei reported no findings."}]
+    return [{"result": "Tool output", "details": "No structured observations are available."}]
+
+
+def _nmap_observations(output: str) -> list[dict[str, str]]:
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return [{"result": "Could not read scan output", "details": "Nmap did not return valid XML."}]
+    rows = []
+    for port in root.findall(".//port"):
+        state_node = port.find("state")
+        state = state_node.get("state", "unknown") if state_node is not None else "unknown"
+        if state != "open":
+            continue
+        service = port.find("service")
+        service_details = []
+        if service is not None:
+            service_details.append(service.get("name", "unknown"))
+            if service.get("product"):
+                product = service.get("product", "")
+                if service.get("version"):
+                    product += f" {service.get('version')}"
+                service_details.append(product)
+        rows.append({
+            "result": f"{port.get('protocol', 'tcp')}/{port.get('portid', '?')} open",
+            "details": " · ".join(service_details) or "Service not identified",
+        })
+    return rows or [{"result": "No open ports found", "details": "No open ports in the configured port range."}]
+
+
+def _httpx_observations(output: str, target: str) -> list[dict[str, str]]:
+    rows = []
+    for item in _json_records(output):
+        host = str(item.get("host") or item.get("input") or item.get("url") or "")
+        if host:
+            parsed_host = urlsplit(host if "://" in host else f"//{host}").hostname
+            if parsed_host and parsed_host.lower() != target.lower():
+                continue
+        url = str(item.get("url") or item.get("input") or target)
+        status = item.get("status_code", item.get("status-code"))
+        title = str(item.get("title", "")).strip()
+        tech = item.get("tech") or []
+        details = []
+        if status is not None:
+            details.append(f"HTTP {status}")
+        if title:
+            details.append(f"title: {title}")
+        if item.get("webserver"):
+            details.append(f"server: {item['webserver']}")
+        if tech:
+            details.append(f"technologies: {', '.join(map(str, tech))}")
+        rows.append({"result": url, "details": " | ".join(details) or "HTTP service responded."})
+    return rows or [{"result": "No HTTP response", "details": "No HTTP endpoint was reported."}]
+
+
+def _whatweb_observations(output: str, target: str) -> list[dict[str, str]]:
+    rows = []
+    for item in _json_records(output):
+        host = str(item.get("target") or item.get("url") or "")
+        if host:
+            parsed_host = urlsplit(host if "://" in host else f"//{host}").hostname
+            if parsed_host and parsed_host.lower() != target.lower():
+                continue
+        if item.get("http_status"):
+            rows.append({"result": "HTTP status", "details": str(item["http_status"])})
+        plugins = item.get("plugins") or {}
+        if isinstance(plugins, dict):
+            for name, metadata in plugins.items():
+                version = metadata.get("version") if isinstance(metadata, dict) else None
+                rows.append({
+                    "result": "Technology",
+                    "details": f"{name} {version}".strip() if version else str(name),
+                })
+    return rows or [{"result": "No technologies detected", "details": "WhatWeb returned no plugin observations."}]
+
+
+def _json_records(output: str) -> list[dict[str, Any]]:
+    try:
+        document = json.loads(output)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, dict):
+        return [document]
+    if isinstance(document, list):
+        return [record for record in document if isinstance(record, dict)]
+    records = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
 def _nmap_findings(output: str, target: str) -> list[dict[str, Any]]:
     try:
         root = ET.fromstring(output)

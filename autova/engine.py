@@ -16,7 +16,7 @@ from autova.reporting import write_reports
 from autova.risk import make_finding, risk_summary
 from autova.scope import Scope, normalize_target
 from autova.terminal import TerminalReporter
-from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_plans
+from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_observations, tool_plans
 
 
 SCHEMA = """
@@ -62,13 +62,16 @@ class AssessmentEngine:
         self.console.reconnaissance(reconnaissance["dns"], reconnaissance["tls"])
         findings = list(reconnaissance["findings"])
         tool_results = []
+        tool_result_rows: dict[str, list[dict[str, str]]] = {}
         for name, args in tool_plans(target, self.scope):
             self.console.tool_warning(name, target)
             result = self.runner.execute(name, args)
             tool_results.append(result)
+            observations = tool_observations(result, target)
+            tool_result_rows[name] = observations
             tool_findings = findings_from_tool(result, target)
             findings.extend(tool_findings)
-            self.console.tool_result(name, result.status, len(tool_findings), result.error)
+            self.console.tool_result(name, result.status, observations)
         summary = risk_summary(findings)
         self.console.analysis(len(findings))
         self.console.risk(summary["overall"], summary["score"], summary["finding_count"])
@@ -94,6 +97,7 @@ class AssessmentEngine:
                 {
                     "name": item.name, "status": item.status, "command": item.command,
                     "returncode": item.returncode, "error": item.error,
+                    "results": tool_result_rows[item.name],
                 }
                 for item in tool_results
             ],

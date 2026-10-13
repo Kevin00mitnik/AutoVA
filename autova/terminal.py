@@ -34,17 +34,34 @@ class TerminalReporter:
     def tool_warning(self, name: str, target: str) -> None:
         print(
             self._paint(
-                f"WARNING [{name}] may send traffic to {target}; confirm authorization and scope.",
+                f"WARNING: {name} may send traffic to {target}; confirm authorization and scope.",
                 "33",
             ),
             file=self.stream,
         )
+        print(self._paint(f"RUNNING {name.upper()}...", "1;36"), file=self.stream)
 
-    def tool_result(self, name: str, status: str, finding_count: int, error: str = "") -> None:
-        detail = f"{finding_count} finding(s)"
-        if error:
-            detail += f" | {error}"
-        self._status_line("ENUM", name, status, detail)
+    def tool_result(self, name: str, status: str, rows: list[dict[str, str]]) -> None:
+        color = {"ok": "32", "missing": "33", "timeout": "33", "error": "31"}.get(status, "36")
+        print(self._paint(f"\n{name.upper()} RESULTS  [{status.upper()}]", f"1;{color}"), file=self.stream)
+        first_width, second_width = 29, 76
+        border = f"+{'-' * (first_width + 2)}+{'-' * (second_width + 2)}+"
+        print(border, file=self.stream)
+        print(f"| {'RESULT':<{first_width}} | {'DETAILS':<{second_width}} |", file=self.stream)
+        print(border, file=self.stream)
+        visible_rows = rows[:20]
+        for row in visible_rows:
+            result = _fit(row.get("result", ""), first_width)
+            details = _fit(row.get("details", ""), second_width)
+            print(f"| {result:<{first_width}} | {details:<{second_width}} |", file=self.stream)
+        if len(rows) > len(visible_rows):
+            remaining = len(rows) - len(visible_rows)
+            print(
+                f"| {_fit('More results', first_width):<{first_width}} | "
+                f"{_fit(f'{remaining} more row(s) are in scan.json', second_width):<{second_width}} |",
+                file=self.stream,
+            )
+        print(border, file=self.stream)
 
     def analysis(self, finding_count: int) -> None:
         self._status_line("ANALYSIS", "Vulnerability review", "done", f"{finding_count} finding(s) normalized")
@@ -74,3 +91,10 @@ class TerminalReporter:
         }.get(status, "36")
         badge = self._paint(f"{status.upper():<8}", status_color)
         print(f"{category:<8} {name:<22} {badge} {detail}", file=self.stream)
+
+
+def _fit(value: str, width: int) -> str:
+    value = " ".join(str(value).split())
+    if len(value) > width:
+        return value[: width - 1] + "…"
+    return value

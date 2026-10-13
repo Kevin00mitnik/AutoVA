@@ -4,7 +4,7 @@ import unittest
 
 from autova.risk import make_finding, risk_summary
 from autova.scope import Scope
-from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_plans
+from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_observations, tool_plans
 
 
 class RiskToolsTests(unittest.TestCase):
@@ -71,6 +71,46 @@ class RiskToolsTests(unittest.TestCase):
         )
         self.assertEqual(len(results), 1)
         self.assertEqual((results[0]["severity"], results[0]["id"]), ("high", "nuclei:xss"))
+
+    def test_each_tool_has_readable_result_observations(self):
+        fixtures = [
+            (
+                "nmap",
+                '<nmaprun><host><ports><port protocol="tcp" portid="443">'
+                '<state state="open"/><service name="https" product="nginx" version="1.2"/>'
+                '</port></ports></host></nmaprun>',
+                "tcp/443 open",
+            ),
+            (
+                "httpx",
+                json.dumps({"url": "https://example.com", "status_code": 200, "title": "Example"}),
+                "HTTP 200",
+            ),
+            (
+                "whatweb",
+                json.dumps({"target": "https://example.com", "http_status": 200, "plugins": {"nginx": {"version": "1.2"}}}),
+                "nginx 1.2",
+            ),
+            ("subfinder", "example.com\napi.example.com\n", "api.example.com"),
+            ("nikto", "+ Server: nginx/1.2\n", "nginx/1.2"),
+            (
+                "nuclei",
+                json.dumps({"template-id": "exposure", "matched-at": "https://example.com/x", "info": {"name": "Exposure", "severity": "medium"}}),
+                "MEDIUM finding",
+            ),
+        ]
+        for tool_name, output, expected in fixtures:
+            with self.subTest(tool=tool_name):
+                rows = tool_observations(ToolResult(tool_name, "ok", [], stdout=output), "example.com")
+                self.assertTrue(any(expected in (row["result"] + " " + row["details"]) for row in rows))
+
+    def test_failed_tool_table_includes_diagnostic(self):
+        rows = tool_observations(
+            ToolResult("httpx", "error", [], returncode=2, stderr="unknown flag: -json"),
+            "example.com",
+        )
+        self.assertEqual(rows[0]["result"], "ERROR")
+        self.assertIn("unknown flag: -json", rows[0]["details"])
 
 
 if __name__ == "__main__":
