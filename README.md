@@ -27,7 +27,7 @@ Python 3.10+ is recommended. Install the Python dependency and whichever externa
 
 ```sh
 python -m pip install -r requirements.txt
-python3 scanner.py --target example.com --scope scope.json
+python3 AutoVA.py --target example.com --scope scope.json
 ```
 
 Outputs:

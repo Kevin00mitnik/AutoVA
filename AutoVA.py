@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authorized-scope assessment CLI."""
+"""AutoVA authorized-scope assessment CLI."""
 
 from autova.cli import main
 
