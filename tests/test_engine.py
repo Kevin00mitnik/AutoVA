@@ -1,4 +1,5 @@
 import json
+import io
 import sqlite3
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from autova.engine import AssessmentEngine
 from autova.scope import Scope
+from autova.terminal import TerminalReporter
 from autova.tools import ToolResult
 
 
@@ -33,7 +35,13 @@ class EngineTests(unittest.TestCase):
     def test_pipeline_persists_db_and_generates_expected_reports(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = FakeRunner()
-            engine = AssessmentEngine(Scope(frozenset({"example.com"})), directory, runner)
+            stream = io.StringIO()
+            engine = AssessmentEngine(
+                Scope(frozenset({"example.com"})),
+                directory,
+                runner,
+                TerminalReporter(stream),
+            )
             engine._reconnaissance = lambda target: {
                 "dns": {"status": "ok", "addresses": ["192.0.2.10"]},
                 "tls": {"status": "error", "error": "not tested"},
@@ -48,7 +56,14 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(saved["pipeline"][0], "TARGET")
             self.assertEqual(len(saved["tools"]), 6)
             self.assertEqual(report["target"], "example.com")
+            self.assertEqual(report["tool_name"], "AutoVA")
+            self.assertEqual(report["author"], "Mohammed Arif Pallath")
             self.assertTrue(all(tool["status"] == "missing" for tool in report["tools"]))
+            output = stream.getvalue()
+            self.assertIn("WARNING [nmap]", output)
+            self.assertIn("ANALYSIS", output)
+            self.assertIn("RISK", output)
+            self.assertIn("report.html", output)
             db = sqlite3.connect(Path(directory) / "assessments.sqlite3")
             try:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scans").fetchone()[0], 1)

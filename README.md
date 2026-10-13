@@ -1,6 +1,8 @@
 # AutoVA
 
-AutoVA is a small assessment pipeline that coordinates DNS and TLS reconnaissance with Nmap, Subfinder, httpx, WhatWeb, Nikto, and Nuclei; normalizes findings; assigns a severity-based risk summary; persists results in SQLite; and emits JSON and HTML reports.
+**AutoVA** is a small assessment pipeline by **Mohammed Arif Pallath**. It coordinates DNS and TLS reconnaissance with Nmap, Subfinder, httpx, WhatWeb, Nikto, and Nuclei; normalizes findings; assigns a severity-based risk summary; persists results in SQLite; and emits JSON and HTML reports.
+
+The CLI prints a compact, color-aware terminal summary grouped by reconnaissance, enumeration, analysis, risk, and reports. Before each scanner invocation it displays a warning identifying the tool and authorized target. Colors are automatically disabled for non-interactive output and when `NO_COLOR` is set.
 
 ## Authorized targets only
 

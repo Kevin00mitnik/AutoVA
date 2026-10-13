@@ -15,6 +15,7 @@ from typing import Any
 from autova.reporting import write_reports
 from autova.risk import make_finding, risk_summary
 from autova.scope import Scope, normalize_target
+from autova.terminal import TerminalReporter
 from autova.tools import ToolResult, ToolRunner, findings_from_tool, tool_plans
 
 
@@ -37,28 +38,44 @@ CREATE TABLE IF NOT EXISTS findings (
 
 
 class AssessmentEngine:
-    def __init__(self, scope: Scope, output_root: str | Path = "reports", runner: ToolRunner | None = None):
+    def __init__(
+        self,
+        scope: Scope,
+        output_root: str | Path = "reports",
+        runner: ToolRunner | None = None,
+        console: TerminalReporter | None = None,
+    ):
         self.scope = scope
         self.output_root = Path(output_root)
         self.runner = runner or ToolRunner(scope)
+        self.console = console or TerminalReporter()
 
     def scan(self, target: str) -> dict[str, Any]:
         target = normalize_target(target)
         if not self.scope.permits(target):
             raise PermissionError(f"Target {target!r} is not explicitly listed in the authorized scope.")
 
+        self.console.start(target)
         scan_id = uuid.uuid4().hex
         started_at = datetime.now(timezone.utc).isoformat()
         reconnaissance = self._reconnaissance(target)
+        self.console.reconnaissance(reconnaissance["dns"], reconnaissance["tls"])
         findings = list(reconnaissance["findings"])
         tool_results = []
         for name, args in tool_plans(target, self.scope):
+            self.console.tool_warning(name, target)
             result = self.runner.execute(name, args)
             tool_results.append(result)
-            findings.extend(findings_from_tool(result, target))
+            tool_findings = findings_from_tool(result, target)
+            findings.extend(tool_findings)
+            self.console.tool_result(name, result.status, len(tool_findings), result.error)
         summary = risk_summary(findings)
+        self.console.analysis(len(findings))
+        self.console.risk(summary["overall"], summary["score"], summary["finding_count"])
         completed_at = datetime.now(timezone.utc).isoformat()
         report: dict[str, Any] = {
+            "tool_name": "AutoVA",
+            "author": "Mohammed Arif Pallath",
             "scan_id": scan_id,
             "target": target,
             "started_at": started_at,
@@ -84,7 +101,8 @@ class AssessmentEngine:
             "findings": findings,
         }
         self._persist(scan_id, target, started_at, completed_at, summary, tool_results, findings)
-        write_reports(self.output_root, target, report, findings)
+        report_dir = write_reports(self.output_root, target, report, findings)
+        self.console.reports(report_dir)
         return report
 
     def _reconnaissance(self, target: str) -> dict[str, Any]:
