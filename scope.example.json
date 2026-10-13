@@ -1,0 +1,6 @@
+{
+  "authorized": false,
+  "targets": ["replace-with-a-host-you-are-authorized-to-test.example"],
+  "rate_limit_rps": 0.5,
+  "max_ports": 100
+}
