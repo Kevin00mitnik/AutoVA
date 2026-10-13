@@ -6,17 +6,18 @@ The CLI prints a compact, color-aware terminal summary grouped by reconnaissance
 
 ## Authorized targets only
 
-Every run requires an explicit JSON scope file containing `"authorized": true` and the **exact** target hostname or IP. URLs, wildcards, and CIDRs are rejected. Passive Subfinder discoveries are recorded as observations only; discovered hosts are never scanned. Obtain the asset owner's permission before enabling authorization.
+Only scan systems you own or have explicit permission to assess. The normal command asks you to confirm authorization before starting active tools:
 
-Copy `scope.example.json` to `scope.json`, replace the target with one you are authorized to assess, and explicitly change `authorized` to `true`:
+```sh
+python AutoVA.py --target example.com
+```
 
-```json
-{
-  "authorized": true,
-  "targets": ["example.com"],
-  "rate_limit_rps": 0.5,
-  "max_ports": 100
-}
+Answer `y` only if you are authorized to scan that exact host. To run non-interactively, pass `--yes` to confirm authorization. The target must be one hostname or IP; URLs, wildcards, and CIDRs are rejected. Passive Subfinder discoveries are recorded as observations only; discovered hosts are never scanned.
+
+For repeatable runs or custom conservative limits, use an optional scope file. Copy `scope.example.json` to `scope.json`, replace the example target, and set `"authorized": true`, then run:
+
+```sh
+python AutoVA.py --target example.com --scope scope.json
 ```
 
 The configured rate paces starts of external tool processes; scanner-native rate flags are capped at 1 request per second (these tools accept integer rates), and port enumeration is capped at 1,000 ports. Every external process has a timeout. Missing tools, timeouts, and failures are explicit in the report, not reported as successful stages. External scanners use conservative options; no scan is run unless the target first passes the explicit scope check.
